@@ -3,7 +3,7 @@ use super::{
     PlannerError, PlannerResult,
 };
 use datafusion::logical_expr::{
-    expr::{Alias, Cast, Placeholder},
+    expr::{Alias, Between, Cast, Placeholder},
     BinaryExpr, Expr, Operator,
 };
 use indexmap::IndexSet;
@@ -35,6 +35,12 @@ pub(crate) fn get_column_idents_from_expr(expr: &Expr) -> IndexSet<Ident> {
             .iter()
             .flat_map(get_column_idents_from_expr)
             .collect(),
+        Expr::Between(Between { expr, low, high, .. }) => {
+            let mut idents = get_column_idents_from_expr(expr);
+            idents.extend(get_column_idents_from_expr(low));
+            idents.extend(get_column_idents_from_expr(high));
+            idents
+        }
         _ => IndexSet::new(),
     }
 }
@@ -119,7 +125,13 @@ fn binary_expr_to_proof_expr(
     }
 }
 
-/// Convert an [`datafusion::expr::Expr`] to [`DynProofExpr`]
+/// Convert a [`datafusion::logical_expr::Expr`] to [`DynProofExpr`].
+///
+/// `BETWEEN low AND high` is spit to `expr >= low AND expr <= high`,
+/// implemented as `NOT(expr < low) AND NOT(expr > high)` since the proof
+/// layer only exposes strict-inequality primitives. `NOT BETWEEN` becomes
+/// `expr < low OR expr > high`. Both bounds are scale-cast against `expr`
+/// independently so that mixed decimal precisions are aligned correctly.
 ///
 /// # Panics
 /// The function should not panic if Proof of SQL is working correctly
@@ -163,6 +175,46 @@ pub fn expr_to_proof_expr(
                         )?,
                     )
                 }
+            }
+        }
+        Expr::Between(Between {
+            expr,
+            negated,
+            low,
+            high,
+        }) => {
+            let expr_proof = expr_to_proof_expr(expr, schema)?;
+            let low_proof = expr_to_proof_expr(low, schema)?;
+            let high_proof = expr_to_proof_expr(high, schema)?;
+
+            let (expr_for_low, scaled_low) =
+                scale_cast_binary_op(expr_proof.clone(), low_proof)?;
+            let (expr_for_high, scaled_high) =
+                scale_cast_binary_op(expr_proof, high_proof)?;
+
+            if *negated {
+                // NOT BETWEEN: expr < low OR expr > high
+                Ok(DynProofExpr::try_new_or(
+                    DynProofExpr::try_new_inequality(expr_for_low, scaled_low, true)?,
+                    DynProofExpr::try_new_inequality(expr_for_high, scaled_high, false)?,
+                )?)
+            } else {
+                // BETWEEN: expr >= low AND expr <= high
+                // expr >= low  ↔  NOT (expr < low)
+                let ge_low = DynProofExpr::try_new_not(DynProofExpr::try_new_inequality(
+                    expr_for_low,
+                    scaled_low,
+                    true,
+                )?)
+                .expect("An inequality expression must have a boolean data type...");
+                // expr <= high  ↔  NOT (expr > high)
+                let le_high = DynProofExpr::try_new_not(DynProofExpr::try_new_inequality(
+                    expr_for_high,
+                    scaled_high,
+                    false,
+                )?)
+                .expect("An inequality expression must have a boolean data type...");
+                Ok(DynProofExpr::try_new_and(ge_low, le_high)?)
             }
         }
         _ => Err(PlannerError::UnsupportedLogicalExpression {
@@ -755,6 +807,76 @@ mod tests {
             expr_to_proof_expr(&expr, &Vec::new()),
             Err(PlannerError::UnsupportedLogicalExpression { .. })
         ));
+    }
+
+    // Between
+    #[test]
+    fn we_can_convert_between_expr_to_proof_expr() {
+        let schema = vec![("column1".into(), ColumnType::BigInt)];
+
+        let col = df_column("namespace.table_name", "column1");
+        let low = Expr::Literal(ScalarValue::Int64(Some(10)));
+        let high = Expr::Literal(ScalarValue::Int64(Some(20)));
+        let expr = col.between(low, high);
+
+        let col_expr = DynProofExpr::new_column(ColumnRef::new(
+            TableRef::from_names(Some("namespace"), "table_name"),
+            "column1".into(),
+            ColumnType::BigInt,
+        ));
+        let low_expr = DynProofExpr::new_literal(LiteralValue::BigInt(10));
+        let high_expr = DynProofExpr::new_literal(LiteralValue::BigInt(20));
+
+        let expected = DynProofExpr::try_new_and(
+            DynProofExpr::try_new_not(
+                DynProofExpr::try_new_inequality(col_expr.clone(), low_expr, true).unwrap(),
+            )
+            .unwrap(),
+            DynProofExpr::try_new_not(
+                DynProofExpr::try_new_inequality(col_expr, high_expr, false).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(expr_to_proof_expr(&expr, &schema).unwrap(), expected);
+    }
+
+    #[test]
+    fn we_can_convert_not_between_expr_to_proof_expr() {
+        let schema = vec![("column1".into(), ColumnType::BigInt)];
+
+        let col = df_column("namespace.table_name", "column1");
+        let low = Expr::Literal(ScalarValue::Int64(Some(10)));
+        let high = Expr::Literal(ScalarValue::Int64(Some(20)));
+        let expr = col.not_between(low, high);
+
+        let col_expr = DynProofExpr::new_column(ColumnRef::new(
+            TableRef::from_names(Some("namespace"), "table_name"),
+            "column1".into(),
+            ColumnType::BigInt,
+        ));
+        let low_expr = DynProofExpr::new_literal(LiteralValue::BigInt(10));
+        let high_expr = DynProofExpr::new_literal(LiteralValue::BigInt(20));
+
+        let expected = DynProofExpr::try_new_or(
+            DynProofExpr::try_new_inequality(col_expr.clone(), low_expr, true).unwrap(),
+            DynProofExpr::try_new_inequality(col_expr, high_expr, false).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(expr_to_proof_expr(&expr, &schema).unwrap(), expected);
+    }
+
+    #[test]
+    fn we_can_extract_column_idents_from_between_expr() {
+        let col = df_column("table", "val");
+        let low = Expr::Literal(ScalarValue::Int64(Some(1)));
+        let high = Expr::Literal(ScalarValue::Int64(Some(100)));
+        let expr = col.between(low, high);
+        let result = get_column_idents_from_expr(&expr);
+        let expected: IndexSet<Ident> = ["val".into()].into_iter().collect();
+        assert_eq!(result, expected);
     }
 
     #[test]
